@@ -54,6 +54,8 @@ option(WHISPER_NO_AVX2                "whisper: disable AVX2" OFF)
 option(WHISPER_NO_FMA                 "whisper: disable FMA"  OFF)
 option(WHISPER_NO_F16C                "whisper: disable F16c" OFF)
 
+option(WHISPER_OPENVINO               "whisper: support for OpenVINO" OFF)
+
 if (APPLE)
     option(WHISPER_NO_ACCELERATE         "whisper: disable Accelerate framework" OFF)
     option(WHISPER_COREML                "whisper: enable Core ML framework"     OFF)
@@ -63,6 +65,7 @@ else()
     option(WHISPER_BLAS_VENDOR           "whisper: BLAS library vendor" Generic)
     option(WHISPER_OPENBLAS              "whisper: prefer OpenBLAS"     OFF)
     option(WHISPER_CUBLAS                "whisper: support for cuBLAS"  OFF)
+    option(WHISPER_HIPBLAS               "whisper: support for hipBLAS" OFF)
     option(WHISPER_CLBLAST               "whisper: use CLBlast"         OFF)
 endif()
 
@@ -134,22 +137,34 @@ if (WHISPER_OPENBLAS)
 endif()
 
 if (WHISPER_BLAS)
-    set(BLA_STATIC 1)
-    set(BLA_VENDOR ${WHISPER_BLAS_VENDOR})
-#    set(BLA_PREFER_PKGCONFIG 1)
-    set(BLA_SIZEOF_INTEGER 8)
-    find_package(BLAS)
+    if (WIN32)
+        if(DEFINED ENV{OPENBLAS_PATH})
+            set(BLAS_LIBRARIES $ENV{OPENBLAS_PATH}/lib/libopenblas.dll.a)
+            message(STATUS "Libraries ${BLAS_LIBRARIES}")
+            set(WHISPER_EXTRA_FLAGS ${WHISPER_EXTRA_FLAGS} -DGGML_USE_OPENBLAS)
+            include_directories($ENV{OPENBLAS_PATH}/include)
+            set(WHISPER_EXTRA_LIBS ${WHISPER_EXTRA_LIBS} ${BLAS_LIBRARIES})
+        else ()
+            message(WARNING "BLAS library was not found. Environment variable OPENBLAS_PATH not defined.")
+        endif ()
+    else ()
+        set(BLA_STATIC 1)
+        set(BLA_VENDOR ${WHISPER_BLAS_VENDOR})
+        #    set(BLA_PREFER_PKGCONFIG 1)
+        set(BLA_SIZEOF_INTEGER 8)
+        find_package(BLAS)
 
-    if(BLAS_FOUND)
-        message(STATUS "BLAS compatible library found")
-        message(STATUS "Libraries ${BLAS_LIBRARIES}")
-        set(WHISPER_EXTRA_FLAGS ${WHISPER_EXTRA_FLAGS} -DGGML_USE_OPENBLAS)
-
-        include_directories(${BLAS_INCLUDE_DIRS})
-        set(WHISPER_EXTRA_LIBS ${WHISPER_EXTRA_LIBS} ${BLAS_LIBRARIES})
-    else()
-        message(WARNING "BLAS library was not found")
-    endif()
+        if(BLAS_FOUND)
+            message(STATUS "BLAS compatible library found")
+            message(STATUS "Libraries ${BLAS_LIBRARIES}")
+            find_path(BLAS_INCLUDE_DIRS cblas.h /usr/include/openblas /usr/local/include/openblas $ENV{BLAS_HOME}/include)
+            set(WHISPER_EXTRA_FLAGS ${WHISPER_EXTRA_FLAGS} -DGGML_USE_OPENBLAS)
+            include_directories(${BLAS_INCLUDE_DIRS})
+            set(WHISPER_EXTRA_LIBS ${WHISPER_EXTRA_LIBS} ${BLAS_LIBRARIES})
+        else()
+            message(WARNING "BLAS library was not found")
+        endif()
+    endif ()
 endif ()
 
 if (WHISPER_CUBLAS)
@@ -177,12 +192,43 @@ if (WHISPER_CUBLAS)
     endif()
 endif()
 
+
+if (WHISPER_HIPBLAS)
+    list(APPEND CMAKE_PREFIX_PATH /opt/rocm)
+    if (NOT ${CMAKE_C_COMPILER_ID} MATCHES "Clang")
+        message(WARNING "Only LLVM is supported for HIP, hint: CC=/opt/rocm/llvm/bin/clang")
+    endif()
+    if (NOT ${CMAKE_CXX_COMPILER_ID} MATCHES "Clang")
+        message(WARNING "Only LLVM is supported for HIP, hint: CXX=/opt/rocm/llvm/bin/clang++")
+    endif()
+
+    find_package(hip)
+    find_package(hipblas)
+    find_package(rocblas)
+
+    if (${hipblas_FOUND} AND ${hip_FOUND})
+        message(STATUS "HIP and hipBLAS found")
+        add_compile_definitions(GGML_USE_HIPBLAS GGML_USE_CUBLAS)
+        add_library(ggml-rocm OBJECT ggml-cuda.cu ggml-cuda.h)
+        set_property(TARGET ggml-rocm PROPERTY POSITION_INDEPENDENT_CODE ON)
+        set_source_files_properties(ggml-cuda.cu PROPERTIES LANGUAGE CXX)
+        target_link_libraries(ggml-rocm PRIVATE hip::device PUBLIC hip::host roc::rocblas roc::hipblas)
+
+        if (WHISPER_STATIC)
+            message(FATAL_ERROR "Static linking not supported for HIP/ROCm")
+        endif()
+        set(WHISPER_EXTRA_LIBS ${WHISPER_EXTRA_LIBS} ggml-rocm)
+    else()
+        message(WARNING "hipBLAS or HIP not found. Try setting CMAKE_PREFIX_PATH=/opt/rocm")
+    endif()
+endif()
+
 if (WHISPER_CLBLAST)
     find_package(CLBlast)
     if (CLBlast_FOUND)
         message(STATUS "CLBlast found")
 
-        set(GGML_OPENCL_SOURCES ggml-opencl.c ggml-opencl.h)
+        set(GGML_OPENCL_SOURCES ggml-opencl.cpp ggml-opencl.h)
 
         add_compile_definitions(GGML_USE_CLBLAST)
 
@@ -190,6 +236,10 @@ if (WHISPER_CLBLAST)
     else()
         message(WARNING "CLBlast not found")
     endif()
+endif()
+
+if( WHISPER_OPENVINO )
+    find_package(OpenVINO REQUIRED COMPONENTS Runtime)
 endif()
 
 # compiler flags
@@ -231,20 +281,25 @@ message(STATUS "CMAKE_SYSTEM_PROCESSOR: ${CMAKE_SYSTEM_PROCESSOR}")
 
 if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "arm" OR ${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
     message(STATUS "ARM detected")
+elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "ppc64le")
+    message(STATUS "PowerPC detected")
 else()
     message(STATUS "x86 detected")
     if (MSVC)
-            if(NOT WHISPER_NO_AVX2)
-                set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX2")
-                set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /arch:AVX2")
-                set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /arch:AVX2")
-            else()
-                if(NOT WHISPER_NO_AVX)
-                    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX")
-                    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /arch:AVX")
-                    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /arch:AVX")
-                endif()
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /utf-8")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /utf-8")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /utf-8")
+        if(NOT WHISPER_NO_AVX2)
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX2")
+            set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /arch:AVX2")
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /arch:AVX2")
+        else()
+            if(NOT WHISPER_NO_AVX)
+                set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX")
+                set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /arch:AVX")
+                set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /arch:AVX")
             endif()
+        endif()
     else()
         if (EMSCRIPTEN)
             set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -pthread")
@@ -264,6 +319,53 @@ else()
             endif()
         endif()
     endif()
+endif()
+
+#
+# POSIX conformance
+#
+
+# clock_gettime came in POSIX.1b (1993)
+# CLOCK_MONOTONIC came in POSIX.1-2001 / SUSv3 as optional
+# posix_memalign came in POSIX.1-2001 / SUSv3
+# M_PI is an XSI extension since POSIX.1-2001 / SUSv3, came in XPG1 (1985)
+add_compile_definitions(_XOPEN_SOURCE=600)
+
+# Somehow in OpenBSD whenever POSIX conformance is specified
+# some string functions rely on locale_t availability,
+# which was introduced in POSIX.1-2008, forcing us to go higher
+if (CMAKE_SYSTEM_NAME MATCHES "OpenBSD")
+    remove_definitions(-D_XOPEN_SOURCE=600)
+    add_compile_definitions(_XOPEN_SOURCE=700)
+endif()
+
+# Data types, macros and functions related to controlling CPU affinity
+# are available on Linux through GNU extensions in libc
+if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+    add_compile_definitions(_GNU_SOURCE)
+endif()
+
+# RLIMIT_MEMLOCK came in BSD, is not specified in POSIX.1,
+# and on macOS its availability depends on enabling Darwin extensions
+# similarly on DragonFly, enabling BSD extensions is necessary
+if (CMAKE_SYSTEM_NAME MATCHES "Darwin")
+    add_compile_definitions(_DARWIN_C_SOURCE)
+endif()
+if (CMAKE_SYSTEM_NAME MATCHES "DragonFly")
+    add_compile_definitions(_DARWIN_C_SOURCE)
+endif()
+
+# alloca is a non-standard interface that is not visible on BSDs when
+# POSIX conformance is specified, but not all of them provide a clean way
+# to enable it in such cases
+if (CMAKE_SYSTEM_NAME MATCHES "FreeBSD")
+    add_compile_definitions(__BSD_VISIBLE)
+endif()
+if (CMAKE_SYSTEM_NAME MATCHES "NetBSD")
+    add_compile_definitions(_NETBSD_SOURCE)
+endif()
+if (CMAKE_SYSTEM_NAME MATCHES "OpenBSD")
+    add_compile_definitions(_BSD_SOURCE)
 endif()
 
 if (WHISPER_PERF)
@@ -297,6 +399,24 @@ if (WHISPER_COREML)
         )
 endif()
 
+if (WHISPER_OPENVINO)
+    set(TARGET whisper.openvino)
+
+    add_library(${TARGET} OBJECT
+        openvino/whisper-openvino-encoder.h
+        openvino/whisper-openvino-encoder.cpp
+        )
+
+    target_include_directories(${TARGET} PUBLIC
+        .
+        )
+
+    set_property(TARGET ${TARGET} PROPERTY POSITION_INDEPENDENT_CODE ON)
+    set(WHISPER_EXTRA_FLAGS ${WHISPER_EXTRA_FLAGS} -DWHISPER_USE_OPENVINO)
+
+    target_link_libraries(${TARGET} PRIVATE openvino::runtime)
+endif()
+
 #
 # whisper - this is the main library of the project
 #
@@ -320,6 +440,10 @@ target_include_directories(${TARGET} PUBLIC
 
 if (WHISPER_COREML)
     target_link_libraries(${TARGET} PRIVATE whisper.coreml)
+endif()
+
+if (WHISPER_OPENVINO)
+    target_link_libraries(${TARGET} PRIVATE whisper.openvino)
 endif()
 
 if (MSVC)
